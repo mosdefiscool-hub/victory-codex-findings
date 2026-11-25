@@ -1,0 +1,354 @@
+diff --git a/crates/victory-shader/src/emit/lower.rs b/crates/victory-shader/src/emit/lower.rs
+index 048739b390574ed3655864a70c29c2614fb3f7b1..141f839ff58558a0fefd5796623ae04b166e81d6 100644
+--- a/crates/victory-shader/src/emit/lower.rs
++++ b/crates/victory-shader/src/emit/lower.rs
+@@ -21,6 +21,7 @@ use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER
+ use crate::structure::{Atom, Bool, LaneExit, Structured};
+ 
+ mod bvh;
++mod loops;
+ 
+ type Why = &'static str;
+ 
+@@ -611,71 +612,6 @@ fn numeric(bools: &crate::structure::Bools, mask: Bool) -> bool {
+         .any(|a| matches!(a, Atom::Opaque(_) | Atom::Constant(_)))
+ }
+ 
+-/// A finite scalar induction loop cannot wait for another wave to make
+-/// progress. Follow the compared SSA value back through immediate additions
+-/// to the header phi, including when the compiler renames the counter.
+-fn counted_wave_loop(p: &Program, header: usize, latch: usize) -> Option<()> {
+-    let head = &p.blocks[header];
+-    let end = &p.blocks[latch];
+-    let Exit::Branch { taken, not_taken } = end.exit else { return None };
+-    let [.., cmp, branch] = end.insts.as_slice() else { return None };
+-    if header == 0 || head.preds.len() != 2 || taken != header || not_taken <= latch
+-        || branch.name() != "s_cbranch_scc0" || cmp.name() != "s_cmp_eq_u32"
+-        || cmp.write(Reg::Scc)? != branch.read(Reg::Scc)?
+-    {
+-        return None;
+-    }
+-    // Single entry. All paths inside the body run forward up to the latch.
+-    for b in header + 1..=latch {
+-        if p.blocks[b].preds.iter().any(|&pred| pred < header || pred >= b) {
+-            return None;
+-        }
+-    }
+-    let incoming = head.preds.iter().position(|&b| b < header)?;
+-    if head.preds[1 - incoming] != latch {
+-        return None;
+-    }
+-    fn sources<const N: usize>(i: &Inst) -> Option<[Operand; N]> {
+-        let Fields::Sop { src, .. } = &i.fields else { return None };
+-        src.as_slice().try_into().ok()
+-    }
+-    let value = |i: &Inst, op| match op {
+-        Operand::Scalar { code, dwords: 1 } => i.read(Reg::S(code)),
+-        _ => None,
+-    };
+-    let immediate = |op| match op {
+-        Operand::Const(n @ 128..=192) => Some(u32::from(n - 128)),
+-        _ => None,
+-    };
+-    let [reg, limit] = sources(cmp)?;
+-    let limit = immediate(limit)?;
+-    let next = value(cmp, reg)?;
+-    let mut current = next;
+-    let mut step = 0u32;
+-    for block in p.blocks[header..=latch].iter().rev() {
+-        for i in block.insts.iter().rev() {
+-            if !i.writes.iter().any(|&(_, v)| v == current) {
+-                continue;
+-            }
+-            if i.name() != "s_add_i32" && i.name() != "s_add_u32" {
+-                return None;
+-            }
+-            let [reg, delta] = sources(i)?;
+-            current = value(i, reg)?;
+-            step = step.checked_add(immediate(delta)?)?;
+-        }
+-    }
+-    let phi = head.phis.iter().find(|phi| phi.value == current)?;
+-    if phi.args[1 - incoming] != next || step == 0 {
+-        return None;
+-    }
+-    let init = p.blocks[head.preds[incoming]].insts.iter().find(|i|
+-        i.name() == "s_mov_b32" && i.write(phi.reg) == Some(phi.args[incoming]))?;
+-    let [start] = sources(init)?;
+-    let distance = limit.checked_sub(immediate(start)?)?;
+-    (distance > 0 && distance.is_multiple_of(step)).then_some(())
+-}
+-
+ /// The dwords an `s_load_dword*` reads.
+ fn smem_dwords(name: &str) -> Option<u32> {
+     match name.strip_prefix("s_load_dword")? {
+@@ -851,7 +787,7 @@ impl<'a> Lower<'a> {
+                     !stores
+                         || !p.blocks.iter().enumerate().any(|(from, block)| {
+                             block.exit.successors().into_iter().any(|to| {
+-                                to <= from && counted_wave_loop(p, to, from).is_none()
++                                to <= from && !loops::finite(p, to, from)
+                             })
+                         })
+                 };
+diff --git a/crates/victory-shader/src/emit/lower/loops.rs b/crates/victory-shader/src/emit/lower/loops.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..44222324c09f6eb313800c2531faba840a24ed23
+--- /dev/null
++++ b/crates/victory-shader/src/emit/lower/loops.rs
+@@ -0,0 +1,176 @@
++//! Termination proofs for guest loops when scheduling logical waves serially.
++use crate::gfx10::{Fields, Operand};
++use crate::ir::{Exit, Inst, Program, Reg, Value};
++
++fn sources<const N: usize>(i: &Inst) -> Option<[Operand; N]> {
++    let Fields::Sop { src, .. } = &i.fields else {
++        return None;
++    };
++    src.as_slice().try_into().ok()
++}
++
++fn value(i: &Inst, op: Operand) -> Option<Value> {
++    match op {
++        Operand::Scalar { code, dwords: 1 } => i.read(Reg::S(code)),
++        _ => None,
++    }
++}
++
++fn immediate(op: Operand) -> Option<u32> {
++    match op {
++        Operand::Const(n @ 128..=192) => Some(u32::from(n - 128)),
++        _ => None,
++    }
++}
++
++fn result(i: &Inst) -> Option<Value> {
++    let Fields::Sop {
++        dst: Some(Operand::Scalar { code, dwords: 1 }),
++        ..
++    } = i.fields
++    else {
++        return None;
++    };
++    i.write(Reg::S(code))
++}
++
++pub(super) fn finite(p: &Program, header: usize, latch: usize) -> bool {
++    let end = &p.blocks[latch];
++    let Exit::Branch { taken, not_taken } = end.exit else {
++        return false;
++    };
++    let [.., cmp, branch] = end.insts.as_slice() else {
++        return false;
++    };
++    header != 0
++        && taken == header
++        && not_taken > latch
++        && branch.name() == "s_cbranch_scc0"
++        && cmp.write(Reg::Scc).is_some()
++        && cmp.write(Reg::Scc) == branch.read(Reg::Scc)
++        && (counted(p, header, latch, cmp).is_some()
++            || clear_low_bit(p, header, latch, cmp).is_some())
++}
++
++/// A finite scalar induction loop cannot wait for another wave to make
++/// progress. Follow the compared SSA value back through immediate additions
++/// to the header phi, including when the compiler renames the counter.
++fn counted(p: &Program, header: usize, latch: usize, cmp: &Inst) -> Option<()> {
++    let head = &p.blocks[header];
++    if head.preds.len() != 2 || !matches!(cmp.name(), "s_cmp_eq_u32" | "s_cmp_ge_i32") {
++        return None;
++    }
++    // Single entry. All paths inside the body run forward up to the latch.
++    for b in header + 1..=latch {
++        if p.blocks[b]
++            .preds
++            .iter()
++            .any(|&pred| pred < header || pred >= b)
++        {
++            return None;
++        }
++    }
++    let incoming = head.preds.iter().position(|&b| b < header)?;
++    if head.preds[1 - incoming] != latch {
++        return None;
++    }
++    let [reg, limit] = sources(cmp)?;
++    let next = value(cmp, reg)?;
++    let mut current = next;
++    let mut step = 0u32;
++    for block in p.blocks[header..=latch].iter().rev() {
++        for i in block.insts.iter().rev() {
++            if !i.writes.iter().any(|&(_, v)| v == current) {
++                continue;
++            }
++            if i.name() != "s_add_i32" && i.name() != "s_add_u32" {
++                return None;
++            }
++            let [reg, delta] = sources(i)?;
++            current = value(i, reg)?;
++            step = step.checked_add(immediate(delta)?)?;
++        }
++    }
++    let phi = head.phis.iter().find(|phi| phi.value == current)?;
++    if phi.args[1 - incoming] != next || step == 0 {
++        return None;
++    }
++    if cmp.name() == "s_cmp_ge_i32" {
++        // Unit increments visit every i32, so must eventually reach a
++        // fixed signed upper bound. A bound defined inside the loop can
++        // move along with the counter or be polled from shared memory.
++        let bound = value(cmp, limit)?;
++        let defined_inside = p.blocks[header..=latch].iter().any(|b| {
++            b.phis.iter().any(|phi| phi.value == bound)
++                || b.insts
++                    .iter()
++                    .any(|i| i.writes.iter().any(|&(_, v)| v == bound))
++        });
++        return (step == 1 && !defined_inside).then_some(());
++    }
++    let limit = immediate(limit)?;
++    let init = p.blocks[head.preds[incoming]]
++        .insts
++        .iter()
++        .find(|i| i.name() == "s_mov_b32" && i.write(phi.reg) == Some(phi.args[incoming]))?;
++    let [start] = sources(init)?;
++    let distance = limit.checked_sub(immediate(start)?)?;
++    (distance > 0 && distance.is_multiple_of(step)).then_some(())
++}
++
++/// On the taken edge, XOR removes the lowest set bit of the compared
++/// mask. A single bit exits before XOR, and even an initial zero becomes
++/// a single bit on the first iteration. Inner loops are checked separately.
++fn clear_low_bit(p: &Program, header: usize, latch: usize, cmp: &Inst) -> Option<()> {
++    let update = &p.blocks[header];
++    let Exit::Jump(join) = update.exit else {
++        return None;
++    };
++    if join != header + 1 || join > latch || update.preds != [latch] || cmp.name() != "s_cmp_eq_u32"
++    {
++        return None;
++    }
++    let body = &p.blocks[join];
++    let back = body.preds.iter().position(|&b| b == header)?;
++    if body.preds.len() != 2 || body.preds[1 - back] >= header {
++        return None;
++    }
++    if (join + 1..=latch).any(|b| {
++        p.blocks[b]
++            .preds
++            .iter()
++            .any(|&pred| pred < join || pred > latch)
++    }) {
++        return None;
++    }
++    let [mask_reg, bit_reg] = sources(cmp)?;
++    let mask = value(cmp, mask_reg)?;
++    let bit = value(cmp, bit_reg)?;
++    let phi = body.phis.iter().find(|phi| phi.value == mask)?;
++    let xor = update
++        .insts
++        .iter()
++        .find(|i| result(i) == Some(phi.args[back]))?;
++    let [bit_arg, mask_arg] = sources(xor)?;
++    if xor.name() != "s_xor_b32" || value(xor, bit_arg)? != bit || value(xor, mask_arg)? != mask {
++        return None;
++    }
++    let [.., and, shift, _, _] = p.blocks[latch].insts.as_slice() else {
++        return None;
++    };
++    let [one, count] = sources(shift)?;
++    let [idx, low_five] = sources(and)?;
++    if shift.name() != "s_lshl_b32"
++        || result(shift)? != bit
++        || immediate(one)? != 1
++        || and.name() != "s_and_b32"
++        || immediate(low_five)? != 31
++        || result(and)? != value(shift, count)?
++    {
++        return None;
++    }
++    let index = value(and, idx)?;
++    let first = body.insts.iter().find(|i| result(i) == Some(index))?;
++    let [source] = sources(first)?;
++    (first.name() == "s_ff1_i32_b32" && value(first, source)? == mask).then_some(())
++}
+diff --git a/crates/victory-shader/src/emit/split_tests.rs b/crates/victory-shader/src/emit/split_tests.rs
+index ce6c79bf87bba184b9bf18af65264a52b70005c3..a21b9cad29c0651ee515ebd4bede5e23eef7f2c0 100644
+--- a/crates/victory-shader/src/emit/split_tests.rs
++++ b/crates/victory-shader/src/emit/split_tests.rs
+@@ -1716,3 +1716,74 @@ fn counted_console_wave_loop_preserves_values() {
+         assert!(emit_for(&program(&bad, 128), target).is_err());
+     }
+ }
++
++/// The outer loop enters at FF1 and clears the lowest set bit on its
++/// backedge. Each bit selects a signed unit-stride range in the inner loop.
++#[test]
++fn nested_bit_scan_and_counted_console_wave_loops_preserve_values() {
++    let body = [
++        0xD760_0009, 0x0001_5100, // v_readlane_b32 s9, v0, 40
++        0x8809_FF09, 0x8000_0000, // s_or_b32 s9, s9, 0x80000000
++        0xBE95_0380, // s_mov_b32 s21, 0 (range hash)
++        0xBE96_0380, // s_mov_b32 s22, 0 (visited bits)
++        0xBE8E_03BF, // s_mov_b32 s14, 63 (range cap)
++        0xBE8F_0382, // s_mov_b32 s15, 2 (range width)
++        0xBF06_8009, // s_cmp_eq_u32 s9, 0
++        0xBF85_0013, // s_cbranch_scc1 done
++        0xBE8A_0309, // s_mov_b32 s10, s9
++        0xBF82_0001, // s_branch scan
++        // clear:
++        0x890A_0A10, // s_xor_b32 s10, s16, s10
++        // scan:
++        0xBE8B_130A, // s_ff1_i32_b32 s11, s10
++        0x930C_0F0B, // s_mul_i32 s12, s11, s15
++        0x8110_0F0C, // s_add_i32 s16, s12, s15
++        0x838D_0E10, // s_min_u32 s13, s16, s14
++        0xBF03_0D0C, // s_cmp_ge_i32 s12, s13
++        0xBF85_000A, // s_cbranch_scc1 done
++        // count:
++        0x9315_8315, // s_mul_i32 s21, s21, 3
++        0x8015_0C15, // s_add_u32 s21, s21, s12
++        0x810C_810C, // s_add_i32 s12, s12, 1
++        0xBF03_0D0C, // s_cmp_ge_i32 s12, s13
++        0xBF84_FFFB, // s_cbranch_scc0 count
++        0xBE96_1D0B, // s_bitset1_b32 s22, s11
++        0x8710_9F0B, // s_and_b32 s16, s11, 31
++        0x8F10_1081, // s_lshl_b32 s16, 1, s16
++        0xBF06_100A, // s_cmp_eq_u32 s10, s16
++        0xBF84_FFEF, // s_cbranch_scc0 clear
++        // done: even lanes store the range hash, odd lanes store the visited bits.
++        0x3606_0081, // v_and_b32 v3, 1, v0
++        0x7D84_0680, // v_cmp_eq_u32 vcc, 0, v3
++        0x7E02_0216, // v_mov_b32 v1, s22
++        0x7E04_0215, // v_mov_b32 v2, s21
++        0xD501_0002, 0x01AA_0501, // v_cndmask_b32 v2, v1, v2, vcc
++    ];
++    let target = super::Target { lanes_min: 32, lanes_max: 32 };
++    let p = program(&body, 128);
++    assert_eq!(emit_for(&p, target).unwrap().group_waves, 2);
++    for (index, replacement, label) in [
++        (26, 0x8F10_1082, "clear a different bit"),
++        (21, 0x810C_800C, "leave the counter unchanged"),
++        (20, 0x810D_830C, "advance the bound with the counter"),
++    ] {
++        let mut bad = body;
++        bad[index] = replacement;
++        assert!(emit_for(&program(&bad, 128), target).is_err(), "{label}");
++    }
++    program_case(
++        "nested scalar bit scan and counted loops",
++        &p,
++        |t| {
++            let bits = 0x8000_0000 | ((t & !63) + 40);
++            if t % 2 == 1 {
++                return bits;
++            }
++            (0..32)
++                .filter(|bit| bits & (1 << bit) != 0)
++                .flat_map(|bit| 2 * bit..(2 * bit + 2).min(63))
++                .fold(0u32, |hash, i| hash.wrapping_mul(3).wrapping_add(i))
++        },
++        true,
++    );
++}

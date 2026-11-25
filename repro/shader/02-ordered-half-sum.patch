@@ -1,0 +1,99 @@
+diff --git a/crates/victory-shader/src/emit/lower.rs b/crates/victory-shader/src/emit/lower.rs
+index da4523963e7bf33dd3f21f9ce051997e3ccd3fc5..8978c47f411d23d06d2e8254ba3a035d8e66c781 100644
+--- a/crates/victory-shader/src/emit/lower.rs
++++ b/crates/victory-shader/src/emit/lower.rs
+@@ -1656,8 +1656,22 @@ impl<'a> Lower<'a> {
+                 self.inst(b, i)?;
+                 self.mode16 = round16_after(&p.blocks[b].insts[i], self.mode16);
+                 if let Some(end) = self.sections.get(&b).and_then(|s| s.get(&i)).map(|s| s.end) {
++                    // The half sum rounds after each addition. In console flow all lanes
++                    // execute the section, so replay its lane moves and additions in order.
++                    let section = &self.sections[&b][&i];
++                    let replay_half = self.console_cf
++                        && section.shapes.iter().any(|(out, shape)| {
++                            self.section_out.contains(out) && matches!(shape, super::wave::Shape::Half(..))
++                        })
++                        && p.blocks[b].insts[i + 1..end].iter().all(|inst| {
++                            matches!(inst.name(), "v_cndmask_b32" | "v_add_f16" | "v_permlanex16_b32" | "v_readlane_b32")
++                        });
+                     for j in i + 1..end {
+-                        self.section_inst(b, j, i);
++                        if replay_half {
++                            self.inst(b, j)?;
++                        } else {
++                            self.section_inst(b, j, i);
++                        }
+                     }
+                     i = end;
+                     continue;
+diff --git a/crates/victory-shader/src/emit/split_tests.rs b/crates/victory-shader/src/emit/split_tests.rs
+index 0b487b718537021d849cec70bdf888678881e1fb..bad1de94b2c216f5f31a21f3d0f0bdff37dc04a4 100644
+--- a/crates/victory-shader/src/emit/split_tests.rs
++++ b/crates/victory-shader/src/emit/split_tests.rs
+@@ -836,6 +836,66 @@ fn masked_whole_wave_sum_straddles_the_halves() {
+     });
+ }
+ 
++/// Each lane starts with 1 + thread_id / 1024 in the low word. The
++/// six guest additions round individually. In wave zero, accumulating
++/// in f32 and rounding once would yield 0x5420 instead of 0x541f.
++#[test]
++fn half_wave_sum_rounds_each_step_across_host_waves() {
++    let body = [
++        0x4a0e_00ff,
++        0x5a5a_3c00, // v_add_nc_u32 v7, literal, v0
++        0xbe80_25c1, // s_or_saveexec_b64 s[0:1], -1
++        0xd501_0001,
++        0x0002_0e80, // v_cndmask_b32 v1, 0, v7, s[0:1]
++        0x6402_02e9,
++        0xde54_c101, // adjacent pairs
++        0x6402_02e9,
++        0x9360_1201, // groups of four
++        0x6402_02e9,
++        0x0009_2401, // groups of eight
++        0x6402_02fa,
++        0xff09_4001, // row mirror
++        0xd778_0002,
++        0x0201_0101, // read the other row of this half
++        0x6402_0302, // v_add_f16 v1, v2, v1
++        0xd760_0009,
++        0x0001_4101, // read lane 32
++        0x6402_0209, // v_add_f16 v1, s9, v1
++        0xd760_000a,
++        0x0001_0101, // read lane 0
++        0xbefe_0400, // restore EXEC
++        0x7e04_020a, // v2 = s10
++    ];
++    flow_case(
++        "ordered half sum",
++        &body,
++        256,
++        |t| 0x5a5a_541f + (t & !63),
++        false,
++    );
++
++    // Only 41 lanes enter. The other 23 must supply the identity to the
++    // sum and keep their previous output after the mask is restored.
++    let mut masked = vec![
++        0x7e0a_0281, // v5 = 1
++        0x7d88_00a9, // v_cmp_gt_u32 vcc, 41, v0
++        0xbe8c_246a, // s_and_saveexec_b64 s[12:13], vcc
++    ];
++    masked.extend_from_slice(&body[..body.len() - 1]);
++    masked.extend_from_slice(&[
++        0x7e0a_020a, // v5 = s10
++        0x88fe_0c7e, // restore the outer mask
++        0x7e04_0305, // v2 = v5
++    ]);
++    flow_case(
++        "masked ordered half sum",
++        &masked,
++        64,
++        |t| if t < 41 { 0x5a5a_5139 } else { 1 },
++        false,
++    );
++}
++
+ /// A whole-wave section crosses the halves only in a group of exactly one
+ /// console wave: with a partial upper half, or none, it still stops.
+ #[test]
